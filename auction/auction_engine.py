@@ -56,26 +56,33 @@ async def background_timer(player_id, mode, session_id):
     # Store initial expiry time in shared memory
     auction_expiry[player_id] = db_expires 
 
-    while True:
-        loop_start = datetime.now(timezone.utc)
-        now = datetime.now(timezone.utc)
+    try:
+        while True:
+            loop_start = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
 
-        # Dynamically read expiry from shared memory (reflects extension instantly)                                              
-        current_expires = auction_expiry.get(player_id, db_expires)
-        remaining = max(0, int((current_expires - now).total_seconds()))                                                         
+            # Dynamically read expiry from shared memory (reflects extension instantly)                                              
+            current_expires = auction_expiry.get(player_id, db_expires)
+            remaining = max(0, int((current_expires - now).total_seconds()))                                                         
 
-        if remaining <= 0:
-            break
+            if remaining <= 0:
+                break
 
-        await sio.emit("timer_update", {
-            "remaining_seconds": remaining,
-            "server_time": now.isoformat()
-        })
+            await sio.emit("timer_update", {
+                "player_id": player_id,
+                "remaining_seconds": remaining,
+                "server_time": now.isoformat()
+            })
 
-        # Calculate exact elapsed processing time to compensate for drift (1.0s target loop time)
-        elapsed = (datetime.now(timezone.utc) - loop_start).total_seconds()
-        sleep_duration = max(0.1, 1.0 - elapsed)
-        await asyncio.sleep(sleep_duration)
+            # Calculate exact elapsed processing time to compensate for drift (1.0s target loop time)
+            elapsed = (datetime.now(timezone.utc) - loop_start).total_seconds()
+            sleep_duration = max(0.1, 1.0 - elapsed)
+            await asyncio.sleep(sleep_duration)
+    except asyncio.CancelledError:
+        print(f"🛑 Background timer task cleanly stopped for player {player_id}")
+        auction_expiry.pop(player_id, None)
+        active_timer_tasks.pop(player_id, None)
+        return
         
     print("⏰ Timer expired")
     auction_expiry.pop(player_id, None)

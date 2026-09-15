@@ -532,39 +532,184 @@ async def next_auction(request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
     cursor = conn.cursor(pymysql.cursors.DictCursor)
 
     try:
-
-        cursor.execute("SELECT player_id FROM current_auction LIMIT 1")
+        cursor.execute("SELECT player_id, mode FROM current_auction LIMIT 1")
         auction = cursor.fetchone()
 
         if not auction:
             raise HTTPException(status_code=400, detail="No active auction")
 
         player_id = auction["player_id"]
+        mode = auction.get("mode", "random")
+        session_id = payload.get("session_id", "default")
 
-        # Force timer expiry
+        # 1. Stop background timer task immediately to prevent concurrent timers
+        stop_timer_task(player_id)
+
+        # 2. Fetch player info
         cursor.execute("""
-            UPDATE current_auction
-            SET expires_at = start_time
-            WHERE player_id = %s
+            SELECT id, name, category, type, image_path, base_price
+            FROM players
+            WHERE id = %s
         """, (player_id,))
+        player_info = cursor.fetchone()
+        if player_info:
+            for k, v in player_info.items():
+                if isinstance(v, Decimal):
+                    player_info[k] = float(v)
+        if not player_info:
+            player_info = {"id": player_id, "name": "Unknown"}
 
+        # 3. Check highest bid in live_bids
+        cursor.execute("""
+            SELECT b.team_id, b.bid_amount, t.name AS team_name, t.image_path
+            FROM live_bids b
+            JOIN teams t ON b.team_id = t.team_id
+            WHERE b.player_id = %s
+            ORDER BY b.bid_amount DESC, b.bid_time ASC
+            LIMIT 1
+        """, (player_id,))
+        top_bid = cursor.fetchone()
+
+        if top_bid:
+            sold_price = float(top_bid["bid_amount"])
+            team_id = top_bid["team_id"]
+            team_name = top_bid["team_name"]
+            team_image = top_bid.get("image_path")
+
+            cursor.execute("""
+                UPDATE teams
+                SET purse = GREATEST(0.0, purse - %s),
+                    Players_Bought = COALESCE(Players_Bought, 0) + 1
+                WHERE team_id = %s
+            """, (sold_price, team_id))
+
+            cursor.execute("SELECT purse FROM teams WHERE team_id = %s", (team_id,))
+            team_row = cursor.fetchone()
+            updated_purse = float(team_row["purse"]) if team_row else 0.0
+
+            winner_sid = team_sockets.get(team_id)
+            if winner_sid:
+                await sio.emit("purse_update", {"purse": updated_purse}, to=winner_sid)
+
+            cursor.execute("""
+                INSERT INTO sold_players (player_id, team_id, sold_price, session_id, sold_time)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, (player_id, team_id, sold_price, session_id))
+
+            end_payload = {
+                "status": "sold",
+                "player": player_info,
+                "team": {
+                    "team_id": team_id,
+                    "team_name": team_name,
+                    "bid_amount": sold_price,
+                    "image_path": team_image
+                },
+                "sold_price": sold_price,
+                "message": f"Player sold to {team_name} for ₹{sold_price}"
+            }
+            print(f"✅ Next Player forced: Player {player_info.get('name')} SOLD to {team_name} for ₹{sold_price}")
+        else:
+            cursor.execute("""
+                INSERT INTO unsold_players (player_id, reason, session_id, added_on)
+                VALUES (%s, %s, %s, NOW())
+            """, (player_id, "No Bids", session_id))
+
+            end_payload = {
+                "status": "unsold",
+                "player": player_info,
+                "base_price": player_info.get("base_price"),
+                "message": "No bids received — player marked UNSOLD"
+            }
+            print(f"⚠️ Next Player forced: Player {player_info.get('name')} marked UNSOLD")
+
+        cursor.execute("DELETE FROM current_auction WHERE player_id = %s", (player_id,))
+        cursor.execute("DELETE FROM live_bids WHERE player_id = %s", (player_id,))
         conn.commit()
 
-        print(f"⏭ Admin forced auction end for player {player_id}")
+        await sio.emit("auction_ended", end_payload)
+        await sio.emit("next_player_loading", {"delay": 10})
+
+        # 4. Advance to next player after delay
+        print("⏳ Waiting 10 seconds before next player")
+        await asyncio.sleep(10)
+
+        cursor.execute("""
+            SELECT * FROM players
+            WHERE id NOT IN (
+                SELECT player_id FROM sold_players
+                UNION
+                SELECT player_id FROM unsold_players
+            )
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+        next_player = cursor.fetchone()
+
+        if not next_player:
+            print("🏁 Auction finished — all players processed")
+            await sio.emit("auction_finished", {"message": "All players processed"})
+            return {
+                "status": "auction_finished",
+                "message": "All players processed",
+                "previous_player": end_payload
+            }
+
+        start_time = datetime.now(timezone.utc)
+        duration = 120
+        expires_at = start_time + timedelta(seconds=duration)
+
+        cursor.execute("""
+            INSERT INTO current_auction (player_id, start_time, expires_at, auction_duration, mode)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (next_player["id"], start_time, expires_at, duration, mode))
+        conn.commit()
+
+        await sio.emit("auction_started", {
+            "player": {
+                "id": next_player["id"],
+                "name": next_player["name"],
+                "image_path": next_player["image_path"],
+                "jersey": next_player["jersey"],
+                "category": next_player["category"],
+                "type": next_player["type"],
+                "base_price": float(next_player.get("base_price") or 0),
+                "highest_runs": next_player.get("highest_runs") or 0
+            },
+            "duration": duration,
+            "expires_at": expires_at.isoformat(),
+            "current_bid": float(next_player.get("base_price") or 0),
+            "history": []
+        })
+
+        asyncio.create_task(
+            background_timer(
+                next_player["id"],
+                mode,
+                session_id
+            )
+        )
+        print(f"🚀 Next auction started for {next_player['name']}")
 
         return {
-            "status": "forced_end",
-            "player_id": player_id
+            "success": True,
+            "previous_player": end_payload,
+            "next_player": {
+                "id": next_player["id"],
+                "name": next_player["name"],
+                "expires_at": expires_at.isoformat()
+            }
         }
 
     except Exception as e:
-
         conn.rollback()
-        print("Next auction error:", e)
-
+        print("❌ Error in next_auction:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
@@ -849,6 +994,9 @@ async def mark_sold(request: Request):
 
     try:
 
+        # Stop background timer task immediately to prevent concurrent timers
+        stop_timer_task(player_id)
+
         # ---------- GET HIGHEST BID ----------
         cursor.execute("""
             SELECT b.team_id, b.bid_amount, t.name AS team_name, t.image_path
@@ -967,7 +1115,7 @@ async def mark_sold(request: Request):
         if not next_player:
             await sio.emit("auction_finished", {})
             return
-        
+
         start_time = datetime.now(timezone.utc)
         duration = 120
         expires_at = start_time + timedelta(seconds=duration)
@@ -987,11 +1135,20 @@ async def mark_sold(request: Request):
         conn.commit()
         
         await sio.emit("auction_started", {
-            "player_id": next_player["id"],
-            "player_name": next_player["name"],
-            "mode": "random",
+            "player": {
+                "id": next_player["id"],
+                "name": next_player["name"],
+                "image_path": next_player["image_path"],
+                "jersey": next_player["jersey"],
+                "category": next_player["category"],
+                "type": next_player["type"],
+                "base_price": float(next_player.get("base_price") or 0),
+                "highest_runs": next_player.get("highest_runs") or 0
+            },
             "duration": duration,
-            "expires_at": expires_at.isoformat()
+            "expires_at": expires_at.isoformat(),
+            "current_bid": float(next_player.get("base_price") or 0),
+            "history": []
         })
         asyncio.create_task(
             background_timer(
@@ -1038,6 +1195,14 @@ async def mark_unsold(request: Request):
     if not payload or payload.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    req_player_id = body.get("player_id")
+    session_id = payload.get("session_id", "default")
+
     conn = get_db_connection()
 
     if not conn:
@@ -1048,13 +1213,17 @@ async def mark_unsold(request: Request):
     try:
 
         # ---------- GET CURRENT PLAYER ----------
-        cursor.execute("SELECT player_id FROM current_auction LIMIT 1")
+        cursor.execute("SELECT player_id, mode FROM current_auction LIMIT 1")
         auction = cursor.fetchone()
 
-        if not auction:
+        if not auction and not req_player_id:
             raise HTTPException(status_code=400, detail="No active auction")
 
-        player_id = auction["player_id"]
+        player_id = req_player_id or auction["player_id"]
+        mode = auction.get("mode", "random") if auction else "random"
+
+        # Stop background timer task immediately to prevent concurrent timers
+        stop_timer_task(player_id)
 
         # ---------- FETCH PLAYER INFO ----------
         cursor.execute("""
@@ -1076,11 +1245,12 @@ async def mark_unsold(request: Request):
         # ---------- INSERT INTO UNSOLD ----------
         cursor.execute("""
             INSERT INTO unsold_players
-            (player_id, reason, added_on)
-            VALUES (%s, %s, NOW())
+            (player_id, reason, session_id, added_on)
+            VALUES (%s, %s, %s, NOW())
         """, (
             player_id,
-            "Marked unsold manually by admin"
+            "Marked unsold manually by admin",
+            session_id
         ))
 
         # ---------- CLEANUP ----------
@@ -1105,13 +1275,81 @@ async def mark_unsold(request: Request):
         }
 
         await sio.emit("auction_ended", payload)
+        await sio.emit("next_player_loading", {"delay": 10})
 
         print(f"⚠️ Player {player_info.get('name')} marked UNSOLD")
+
+        # Advance to next player
+        print("⏳ Waiting 10 seconds before next player")
+        await asyncio.sleep(10)
+
+        cursor.execute("""
+            SELECT * FROM players
+            WHERE id NOT IN (
+                SELECT player_id FROM sold_players
+                UNION
+                SELECT player_id FROM unsold_players
+            )
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+        next_player = cursor.fetchone()
+
+        if not next_player:
+            print("🏁 Auction finished — all players processed")
+            await sio.emit("auction_finished", {"message": "All players processed"})
+            return {
+                "success": True,
+                "status": "auction_finished",
+                "message": "Player marked as UNSOLD, all players processed",
+                "player": player_info
+            }
+
+        start_time = datetime.now(timezone.utc)
+        duration = 120
+        expires_at = start_time + timedelta(seconds=duration)
+
+        cursor.execute("""
+            INSERT INTO current_auction (player_id, start_time, expires_at, auction_duration, mode)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (next_player["id"], start_time, expires_at, duration, mode))
+        conn.commit()
+
+        await sio.emit("auction_started", {
+            "player": {
+                "id": next_player["id"],
+                "name": next_player["name"],
+                "image_path": next_player["image_path"],
+                "jersey": next_player["jersey"],
+                "category": next_player["category"],
+                "type": next_player["type"],
+                "base_price": float(next_player.get("base_price") or 0),
+                "highest_runs": next_player.get("highest_runs") or 0
+            },
+            "duration": duration,
+            "expires_at": expires_at.isoformat(),
+            "current_bid": float(next_player.get("base_price") or 0),
+            "history": []
+        })
+
+        asyncio.create_task(
+            background_timer(
+                next_player["id"],
+                mode,
+                session_id
+            )
+        )
+        print(f"🚀 Next auction started for {next_player['name']}")
 
         return {
             "success": True,
             "message": "Player marked as UNSOLD",
-            "player": player_info
+            "player": player_info,
+            "next_player": {
+                "id": next_player["id"],
+                "name": next_player["name"],
+                "expires_at": expires_at.isoformat()
+            }
         }
 
     except Exception as e:
@@ -1357,6 +1595,7 @@ async def restart_player(request: Request):
             "mode": "specific",
             "duration": duration,
             "expires_at": expires_at.isoformat(),
+            "current_bid": float(player.get("base_price") or 0),
             "history": []
         })
 

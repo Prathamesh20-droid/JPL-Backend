@@ -31,5 +31,8 @@ Docs/
 #text
 *.txt
 
+
+#Tests
+tests/
 #Errors
 Errors/

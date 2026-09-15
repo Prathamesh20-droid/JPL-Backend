@@ -138,6 +138,17 @@ def register_socket_events():
 
             top_bid = cursor.fetchone()
 
+            # Calculate remaining seconds
+            expires_at = auction.get("expires_at")
+            if expires_at:
+                if isinstance(expires_at, str):
+                    expires_at = datetime.fromisoformat(expires_at)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                remaining = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+            else:
+                remaining = int(auction.get("auction_duration") or 120)
+
             await sio.emit("auction_status", {
                 "status": "auction_active",
                 "player": {
@@ -150,6 +161,7 @@ def register_socket_events():
                     "base_price": float(auction.get("base_price") or 0),
                     "highest_runs": auction.get("highest_runs") or 0
                 },
+                "remaining_seconds": remaining,
                 "team_purse": updated_purse,
                 "highest_bid": {
                     "team_id": top_bid["team_id"],
@@ -208,22 +220,22 @@ def register_socket_events():
                    )                                                                                                               
                    return                                                                                                          
 
-            if user.get("role") == "team":                                                                                      
-                team_id = user.get("team_id")                                                                                   
-                if not team_id:                                                                                                 
-                       await sio.emit("bid_rejected", {"error": "User is not assigned to any team"}, to=sid)                       
-                       return                                                                                                      
-                else:                                                                                                               
-                   # Admins can pass team_id directly for manual/testing bids                                                      
-                   team_id = data.get("team_id")        
+            if user.get("role") == "team":
+                team_id = user.get("team_id")
+                if not team_id:
+                    await sio.emit("bid_rejected", {"error": "User is not assigned to any team"}, to=sid)
+                    return
+            else:
+                # Admins can pass team_id directly for manual/testing bids
+                team_id = data.get("team_id")
 
-                if bid_value is None:
-                    await sio.emit(
+            if bid_value is None:
+                await sio.emit(
                     "bid_rejected",
                     {"error": "Bid amount is required"},
                     to=sid
                 )
-                    return
+                return
             
             bid_amount = float(bid_value)
 
