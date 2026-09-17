@@ -11,7 +11,8 @@ sio = socketio.AsyncServer(
     cors_allowed_origins=[
         f"http://localhost:{FRONTEND_PORT}",
         f"http://127.0.0.1:{FRONTEND_PORT}",
-        f"http://{local_ip}:{FRONTEND_PORT}"
+        f"http://{local_ip}:{FRONTEND_PORT}",
+        "https://jpl-frontend.vercel.app"
     ],
     logger=True,
     engineio_logger=True
