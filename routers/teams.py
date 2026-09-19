@@ -439,6 +439,15 @@ async def delete_team(team_id: int, request: Request):
         if not team:
             raise HTTPException(status_code=404, detail=f"Team with ID {team_id} not found")
 
+        # Delete team image from bucket
+        image_path = team.get("image_path")
+        if image_path:
+            try:
+                from core.image_handler import delete_image_from_supabase
+                delete_image_from_supabase(image_path)
+            except Exception as img_err:
+                print(f"⚠️ Warning deleting team image: {img_err}")
+
         # Clean related records across tables
         cursor.execute("DELETE FROM live_bids WHERE team_id = %s", (team_id,))
         cursor.execute("DELETE FROM bids WHERE team_id = %s", (team_id,))

@@ -77,6 +77,15 @@ def delete_image_from_supabase(path: str):
     """Deletes an image file from the Supabase Storage bucket."""
     try:
         supabase = get_supabase_admin_client()
+        
+        # If the path is a full URL, extract the actual storage path
+        # Example URL: https://<project>.supabase.co/storage/v1/object/public/<bucket>/players/<uuid>.webp
+        if path and path.startswith("http"):
+            # Extract everything after the bucket name
+            marker = f"/{BUCKET_NAME}/"
+            if marker in path:
+                path = path.split(marker)[-1]
+                
         supabase.storage.from_(BUCKET_NAME).remove([path])
     except Exception as e:
         print(f"⚠️ Failed to delete image from Supabase storage: {e}")
