@@ -518,39 +518,13 @@ async def resume_auction(request: Request):
         conn.close()
 
 
-@router.post("/next-auction")
-async def next_auction(request: Request):
-
-    token = get_token_from_request(request)
-
-    if not token:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    payload = verify_token(token)
-
-    if not payload or payload.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden")
-
+async def process_next_auction_background(player_id, mode, session_id):
     conn = get_db_connection()
     if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
+        print("⚠ DB connection failed in process_next_auction_background")
+        return
     cursor = conn.cursor(pymysql.cursors.DictCursor)
-
     try:
-        cursor.execute("SELECT player_id, mode FROM current_auction LIMIT 1")
-        auction = cursor.fetchone()
-
-        if not auction:
-            raise HTTPException(status_code=400, detail="No active auction")
-
-        player_id = auction["player_id"]
-        mode = auction.get("mode", "random")
-        session_id = payload.get("session_id", "default")
-
-        # 1. Stop background timer task immediately to prevent concurrent timers
-        stop_timer_task(player_id)
-
         # 2. Fetch player info
         cursor.execute("""
             SELECT id, name, category, type, image_path, base_price
@@ -558,6 +532,7 @@ async def next_auction(request: Request):
             WHERE id = %s
         """, (player_id,))
         player_info = cursor.fetchone()
+        from decimal import Decimal
         if player_info:
             for k, v in player_info.items():
                 if isinstance(v, Decimal):
@@ -655,11 +630,7 @@ async def next_auction(request: Request):
         if not next_player:
             print("🏁 Auction finished — all players processed")
             await sio.emit("auction_finished", {"message": "All players processed"})
-            return {
-                "status": "auction_finished",
-                "message": "All players processed",
-                "previous_player": end_payload
-            }
+            return
 
         start_time = datetime.now(timezone.utc)
         duration = 120
@@ -688,6 +659,7 @@ async def next_auction(request: Request):
             "history": []
         })
 
+        from auction.auction_engine import background_timer
         asyncio.create_task(
             background_timer(
                 next_player["id"],
@@ -697,21 +669,53 @@ async def next_auction(request: Request):
         )
         print(f"🚀 Next auction started for {next_player['name']}")
 
-        return {
-            "success": True,
-            "previous_player": end_payload,
-            "next_player": {
-                "id": next_player["id"],
-                "name": next_player["name"],
-                "expires_at": expires_at.isoformat()
-            }
-        }
-
     except Exception as e:
         conn.rollback()
+        print("❌ Error in process_next_auction_background:", e)
+    finally:
+        cursor.close()
+        conn.close()
+
+@router.post("/next-auction")
+async def next_auction(request: Request):
+
+    token = get_token_from_request(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    payload = verify_token(token)
+    if not payload or payload.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    cursor = conn.cursor(pymysql.cursors.DictCursor)
+    try:
+        cursor.execute("SELECT player_id, mode FROM current_auction LIMIT 1")
+        auction = cursor.fetchone()
+
+        if not auction:
+            raise HTTPException(status_code=400, detail="No active auction")
+
+        player_id = auction["player_id"]
+        mode = auction.get("mode", "random")
+        session_id = payload.get("session_id", "default")
+
+        # 1. Stop background timer task immediately to prevent concurrent timers
+        stop_timer_task(player_id)
+
+        # 2. Spawn background task to handle end of auction and next player
+        asyncio.create_task(process_next_auction_background(player_id, mode, session_id))
+
+        return {"success": True, "message": "Next player sequence initiated"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
         print("❌ Error in next_auction:", e)
         raise HTTPException(status_code=500, detail=str(e))
-
     finally:
         cursor.close()
         conn.close()
