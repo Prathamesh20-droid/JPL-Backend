@@ -573,9 +573,9 @@ async def process_next_auction_background(player_id, mode, session_id):
                 await sio.emit("purse_update", {"purse": updated_purse}, to=winner_sid)
 
             cursor.execute("""
-                INSERT INTO sold_players (player_id, team_id, sold_price, session_id, sold_time)
-                VALUES (%s, %s, %s, %s, NOW())
-            """, (player_id, team_id, sold_price, session_id))
+                INSERT INTO sold_players (player_id, team_id, sold_price, sold_time)
+                VALUES (%s, %s, %s, NOW())
+            """, (player_id, team_id, sold_price))
 
             end_payload = {
                 "status": "sold",
@@ -592,9 +592,9 @@ async def process_next_auction_background(player_id, mode, session_id):
             print(f"✅ Next Player forced: Player {player_info.get('name')} SOLD to {team_name} for ₹{sold_price}")
         else:
             cursor.execute("""
-                INSERT INTO unsold_players (player_id, reason, session_id, added_on)
-                VALUES (%s, %s, %s, NOW())
-            """, (player_id, "No Bids", session_id))
+                INSERT INTO unsold_players (player_id, reason, added_on)
+                VALUES (%s, %s, NOW())
+            """, (player_id, "No Bids"))
 
             end_payload = {
                 "status": "unsold",
@@ -1043,9 +1043,9 @@ async def mark_sold(request: Request):
 
         # ---------- INSERT SOLD PLAYER ----------
         cursor.execute("""
-            INSERT INTO sold_players (player_id, team_id, sold_price, session_id, sold_time)
-            VALUES (%s, %s, %s, %s, NOW())
-        """, (player_id, team_id, sold_price, session_id))
+            INSERT INTO sold_players (player_id, team_id, sold_price, sold_time)
+            VALUES (%s, %s, %s, NOW())
+        """, (player_id, team_id, sold_price))
 
         # ---------- CLEAN AUCTION TABLES ----------
         cursor.execute(
@@ -1249,12 +1249,11 @@ async def mark_unsold(request: Request):
         # ---------- INSERT INTO UNSOLD ----------
         cursor.execute("""
             INSERT INTO unsold_players
-            (player_id, reason, session_id, added_on)
-            VALUES (%s, %s, %s, NOW())
+            (player_id, reason, added_on)
+            VALUES (%s, %s, NOW())
         """, (
             player_id,
-            "Marked unsold manually by admin",
-            session_id
+            "Marked unsold manually by admin"
         ))
 
         # ---------- CLEANUP ----------
